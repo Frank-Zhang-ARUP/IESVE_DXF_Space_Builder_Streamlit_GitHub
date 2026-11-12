@@ -1,7 +1,11 @@
-import gc, io, math, os, re, tempfile
+import gc, io, math, os, re, tempfile, pathlib
 from collections import Counter
 import streamlit as st
 import ezdxf
+try:
+    import ezdwg
+except ImportError:
+    ezdwg = None
 from ezdxf.disassemble import recursive_decompose
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import polygonize, snap, unary_union
@@ -132,17 +136,50 @@ def make_output(selected, units, text_height, layer_poly, layer_text):
         try: os.remove(path)
         except OSError: pass
 
-uploaded=st.file_uploader(f"Architectural DXF (recommended <= {MAX_UPLOAD_MB} MB)",type=["dxf"])
+def load_cad_upload(uploaded):
+    suffix = pathlib.Path(uploaded.name).suffix.lower()
+    raw = uploaded.getvalue()
+    if suffix == ".dxf":
+        doc = tmp_read_dxf(raw)
+        del raw; gc.collect()
+        return doc
+    if suffix != ".dwg":
+        raise ValueError("Please upload a DWG or DXF file.")
+    if ezdwg is None:
+        raise RuntimeError("DWG support package ezdwg is not installed.")
+    in_path = out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".dwg", delete=False) as f:
+            f.write(raw); in_path = f.name
+        del raw; gc.collect()
+        fd, out_path = tempfile.mkstemp(suffix=".dxf"); os.close(fd)
+        # Convert uploaded DWG to a temporary R2010 DXF, then run the normal DXF pipeline.
+        result = ezdwg.to_dxf(in_path, out_path, dxf_version="R2010", strict=False, include_unsupported=True)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("DWG conversion produced no DXF output.")
+        return ezdxf.readfile(out_path)
+    finally:
+        for path in (in_path, out_path):
+            if path and os.path.exists(path):
+                try: os.remove(path)
+                except OSError: pass
+        try:
+            if ezdwg is not None: ezdwg.clear_decode_caches()
+        except Exception:
+            pass
+        gc.collect()
+
+uploaded=st.file_uploader(f"Architectural DWG / DXF (recommended <= {MAX_UPLOAD_MB} MB)",type=["dwg","dxf"])
 if uploaded:
     if uploaded.size>MAX_UPLOAD_MB*1024*1024:
         st.error("DXF exceeds the cloud-safe upload limit."); st.stop()
     expand=st.checkbox("Expand block geometry",value=True,help="Required when walls are inside blocks/Xrefs already bound into the DXF. External Xrefs are not loaded.")
     chord=st.number_input("Curve approximation chord length (drawing units)",0.1,10000.0,100.0)
     try:
-        raw=uploaded.getvalue(); doc=tmp_read_dxf(raw); del raw; gc.collect()
+        doc=load_cad_upload(uploaded)
         counts,texts=scan(doc,expand,float(chord))
     except Exception as ex:
-        st.error(f"DXF scan failed: {type(ex).__name__}: {ex}"); st.stop()
+        st.error(f"CAD scan/conversion failed: {type(ex).__name__}: {ex}"); st.stop()
 
     c1,c2,c3=st.columns(3)
     c1.metric("Geometry layers",len(counts)); c2.metric("Room-label candidates",len(texts)); c3.metric("Geometry entities",sum(counts.values()))
